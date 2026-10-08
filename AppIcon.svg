@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#2A2A30"/>
+      <stop offset="100%" stop-color="#111115"/>
+    </linearGradient>
+    <radialGradient id="redGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FF3B30" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#FF3B30" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="16" stdDeviation="20" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <!-- Squircle shape only - background around it remains transparent -->
+  <rect x="64" y="64" width="896" height="896" rx="200" ry="200" fill="url(#bgGrad)" filter="url(#shadow)"/>
+  <rect x="64" y="64" width="896" height="896" rx="200" ry="200" fill="none" stroke="#FFFFFF" stroke-opacity="0.1" stroke-width="4"/>
+
+  <!-- LED Light -->
+  <circle cx="830" cy="194" r="70" fill="url(#redGlow)" opacity="0.4"/>
+  <circle cx="830" cy="194" r="28" fill="#FF3B30"/>
+
+  <!-- Piano Keys -->
+  <g>
+    <!-- White Keys -->
+    <rect x="192" y="320" width="120" height="420" rx="16" fill="#F8F9FA"/>
+    <rect x="320" y="320" width="120" height="420" rx="16" fill="#F8F9FA"/>
+    <rect x="448" y="320" width="120" height="420" rx="16" fill="#F8F9FA"/>
+    <rect x="576" y="320" width="120" height="420" rx="16" fill="#F8F9FA"/>
+    <rect x="704" y="320" width="120" height="420" rx="16" fill="#F8F9FA"/>
+
+    <line x1="318" y1="320" x2="318" y2="736" stroke="#D1D5DB" stroke-width="2"/>
+    <line x1="446" y1="320" x2="446" y2="736" stroke="#D1D5DB" stroke-width="2"/>
+    <line x1="574" y1="320" x2="574" y2="736" stroke="#D1D5DB" stroke-width="2"/>
+    <line x1="702" y1="320" x2="702" y2="736" stroke="#D1D5DB" stroke-width="2"/>
+
+    <!-- Black Keys -->
+    <rect x="272" y="320" width="76" height="260" rx="10" fill="#1F2937"/>
+    <rect x="408" y="320" width="76" height="260" rx="10" fill="#1F2937"/>
+    <rect x="660" y="320" width="76" height="260" rx="10" fill="#1F2937"/>
+  </g>
+</svg>
