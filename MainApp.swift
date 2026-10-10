@@ -243,7 +243,7 @@ final class MIDIRecorderEngine: ObservableObject {
                     memcpy(
                         UnsafeMutableRawPointer(ptr).advanced(by: MemoryLayout<MIDIMetaEvent>.size),
                         dataBytes,
-                        dataBytes.count
+                        dataBytes.count,
                     )
                     status = MusicTrackNewMetaEvent(track, 0, ptr)
                 }
