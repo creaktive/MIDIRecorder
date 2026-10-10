@@ -314,19 +314,21 @@ final class MIDIRecorderEngine: ObservableObject {
     }
 
     private func resetSilenceTimer() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            silenceTimer?.invalidate()
-            silenceTimer = Timer.scheduledTimer(withTimeInterval: silenceInterval, repeats: false) { _ in
-                self.queue.async {
-                    self.saveCurrentSequenceAndReset()
-                }
+        silenceTimer?.invalidate()
+        silenceTimer = Timer.scheduledTimer(withTimeInterval: silenceInterval, repeats: false) { _ in
+            self.queue.async {
+                self.saveCurrentSequenceAndReset()
             }
         }
     }
 
     private func saveCurrentSequenceAndReset() {
         guard let sequence = currentSequence, let startTime = sequenceStartTime else { return }
+
+        if liveNoteCount == 0 {
+            createNewSequence()
+            return
+        }
 
         let durationInSeconds = Int(Date().timeIntervalSince(startTime))
         let dateFormatter = DateFormatter()
