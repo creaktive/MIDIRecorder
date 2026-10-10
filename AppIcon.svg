@@ -39,5 +39,13 @@
     <rect x="272" y="320" width="76" height="260" rx="10" fill="#1F2937"/>
     <rect x="408" y="320" width="76" height="260" rx="10" fill="#1F2937"/>
     <rect x="660" y="320" width="76" height="260" rx="10" fill="#1F2937"/>
+
+    <!-- Half G# (overflow past 5th white key, clipped) -->
+    <clipPath id="pianoClip">
+      <rect x="180" y="310" width="654" height="440"/>
+    </clipPath>
+    <g clip-path="url(#pianoClip)">
+      <rect x="796" y="320" width="76" height="260" rx="10" fill="#1F2937"/>
+    </g>
   </g>
 </svg>
