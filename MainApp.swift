@@ -224,6 +224,27 @@ final class MIDIRecorderEngine: ObservableObject {
         NewMusicSequence(&currentSequence)
         if let seq = currentSequence {
             MusicSequenceNewTrack(seq, &currentTrack)
+            if let track = currentTrack {
+                let watermark = "MIDIRecorder"
+                let dataBytes = Array(watermark.utf8)
+                let size = MemoryLayout<MIDIMetaEvent>.size + dataBytes.count
+                let mem = UnsafeMutablePointer<UInt8>.allocate(capacity: size)
+                defer { mem.deallocate() }
+                var status: OSStatus = -1
+                mem.withMemoryRebound(to: MIDIMetaEvent.self, capacity: 1) { ptr in
+                    ptr.pointee.metaEventType = 0x02
+                    ptr.pointee.dataLength = UInt32(dataBytes.count)
+                    memcpy(
+                        UnsafeMutableRawPointer(ptr).advanced(by: MemoryLayout<MIDIMetaEvent>.size),
+                        dataBytes,
+                        dataBytes.count
+                    )
+                    status = MusicTrackNewMetaEvent(track, 0, ptr)
+                }
+                if status != noErr {
+                    print("Failed to add watermark meta-event: \(status)")
+                }
+            }
         }
         sequenceStartTime = nil
         DispatchQueue.main.async {
