@@ -20,6 +20,16 @@ if [ -f "AppIcon.svg" ]; then
     fi
 fi
 
+# Render small menu bar icon (~22px) from SVG
+if [ -f "AppIcon.svg" ]; then
+    if command -v rsvg-convert &> /dev/null; then
+        rsvg-convert -w 22 -h 22 -f png AppIcon.svg -o "${BUNDLE_DIR}/Contents/Resources/menuBar.png"
+    else
+        qlmanage -t -s 22 -o /tmp AppIcon.svg > /dev/null 2>&1
+        mv /tmp/AppIcon.svg.png "${BUNDLE_DIR}/Contents/Resources/menuBar.png"
+    fi
+fi
+
 # Write Contents.json if missing
 cat <<'EOF' > AppIcon.appiconset/Contents.json
 {

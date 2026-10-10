@@ -33,7 +33,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Setup Menu Bar Status Item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "pianokeys", accessibilityDescription: "MIDI Recorder")
+            let menuBarIcon = NSImage(named: "menuBar")
+            if let icon = menuBarIcon {
+                icon.size = NSSize(width: 18, height: 18)
+                button.image = icon
+            } else {
+                button.image = NSImage(systemSymbolName: "pianokeys", accessibilityDescription: "MIDI Recorder")
+            }
             button.action = #selector(togglePopover)
             button.target = self
         }
