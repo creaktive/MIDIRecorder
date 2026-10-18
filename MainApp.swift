@@ -21,11 +21,12 @@ struct MIDIRecorderApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
+    private var activity: NSObjectProtocol? // token must stay alive or App Nap returns
     private let engine = MIDIRecorderEngine.shared
 
     func applicationDidFinishLaunching(_: Notification) {
         // Prevent App Nap from throttling background recording timers
-        _ = ProcessInfo.processInfo.beginActivity(
+        activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled],
             reason: "Continuous background MIDI capture",
         )
@@ -50,6 +51,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: MenuBarView())
         self.popover = popover
+    }
+
+    func applicationWillTerminate(_: Notification) {
+        engine.flush()
     }
 
     @objc private func togglePopover() {
@@ -184,7 +189,8 @@ final class MIDIRecorderEngine: ObservableObject {
     private var currentTrack: MusicTrack?
     private var sequenceStartTime: Date?
 
-    private var silenceTimer: Timer?
+    private var silenceWork: DispatchWorkItem?
+    private var noteCount = 0
     private let silenceInterval: TimeInterval = 5.0
     private let outputDirectory: URL
 
@@ -205,14 +211,21 @@ final class MIDIRecorderEngine: ObservableObject {
                 self?.connectAllSources()
             }
         }
-        guard status == noErr else { return }
+        guard status == noErr else { return reportSetupFailure(status) }
 
         status = MIDIInputPortCreateWithBlock(client, "MIDIRecorderInput" as CFString, &inputPort) { [weak self] packetListPtr, _ in
             self?.handleIncomingMIDIPackets(packetListPtr)
         }
-        guard status == noErr else { return }
+        guard status == noErr else { return reportSetupFailure(status) }
 
         connectAllSources()
+    }
+
+    private func reportSetupFailure(_ status: OSStatus) {
+        print("CoreMIDI setup failed: \(status)")
+        DispatchQueue.main.async {
+            self.lastSavedFilename = "MIDI setup failed (\(status))"
+        }
     }
 
     private func connectAllSources() {
@@ -253,105 +266,96 @@ final class MIDIRecorderEngine: ObservableObject {
             }
         }
         sequenceStartTime = nil
+        noteCount = 0
         DispatchQueue.main.async {
             self.liveNoteCount = 0
         }
     }
 
     private func handleIncomingMIDIPackets(_ packetListPtr: UnsafePointer<MIDIPacketList>) {
-        guard !isPaused else { return }
-
-        let packetList = packetListPtr.pointee
-        var packet = packetList.packet
+        // Copy every packet now: the list is only valid during this callback.
+        let packets = packetListPtr.unsafeSequence().map { $0.pointee }
+        let now = Date()
+        let paused = isPaused
 
         queue.async { [weak self] in
             guard let self else { return }
 
-            let now = Date()
+            var messages = packets.flatMap(Self.channelMessages)
+            if paused {
+                // Still close notes opened before the pause, but never start a take.
+                messages = messages.filter(Self.isNoteOff)
+                if sequenceStartTime == nil { return }
+            }
+            // Clock, active sensing and SysEx carry no channel messages: they must not start a take or reset the silence timer.
+            guard !messages.isEmpty else { return }
+
             if sequenceStartTime == nil {
                 sequenceStartTime = now
             }
+            guard let startTime = sequenceStartTime, let track = currentTrack else { return }
 
-            for _ in 0 ..< packetList.numPackets {
-                processPacket(packet, arrivalTime: now)
-                packet = MIDIPacketNext(&packet).pointee
+            let timeInBeats = MusicTimeStamp(now.timeIntervalSince(startTime) * 2.0)
+            for var message in messages {
+                MusicTrackNewMIDIChannelEvent(track, timeInBeats, &message)
+                if message.status & 0xF0 == 0x90, message.data2 > 0 {
+                    noteCount += 1
+                }
             }
 
+            let count = noteCount
+            DispatchQueue.main.async {
+                self.liveNoteCount = count
+            }
             resetSilenceTimer()
         }
     }
 
-    private func processPacket(_ packet: MIDIPacket, arrivalTime: Date) {
-        guard let startTime = sequenceStartTime, let track = currentTrack else { return }
+    private static func isNoteOff(_ m: MIDIChannelMessage) -> Bool {
+        m.status & 0xF0 == 0x80 || (m.status & 0xF0 == 0x90 && m.data2 == 0)
+    }
 
-        let timeOffset = arrivalTime.timeIntervalSince(startTime)
-        let timeInBeats = MusicTimeStamp(timeOffset * 2.0)
-
-        let data = Mirror(reflecting: packet.data).children.map { $0.value as! UInt8 }
+    /// Splits a packet into channel messages; skips real-time bytes, SysEx and truncated messages.
+    private static func channelMessages(_ packet: MIDIPacket) -> [MIDIChannelMessage] {
         let length = Int(packet.length)
-
-        var i = 0
-        while i < length {
-            let status = data[i]
-            let command = status & 0xF0
-
-            if command == 0x90 || command == 0x80 {
-                if i + 2 < length {
-                    let note = data[i + 1]
-                    let velocity = data[i + 2]
-
-                    if command == 0x90, velocity > 0 {
-                        DispatchQueue.main.async {
-                            self.liveNoteCount += 1
-                        }
-                    }
-
-                    var noteMessage = MIDINoteMessage(
-                        channel: status & 0x0F,
-                        note: note,
-                        velocity: command == 0x80 ? 0 : velocity,
-                        releaseVelocity: 0,
-                        duration: 0.1,
-                    )
-                    MusicTrackNewMIDINoteEvent(track, timeInBeats, &noteMessage)
-                    i += 3
-                } else {
-                    break
-                }
-            } else if command >= 0x80, command < 0xF0 {
-                if i + 2 < length {
-                    var channelMessage = MIDIChannelMessage(status: status, data1: data[i + 1], data2: data[i + 2], reserved: 0)
-                    MusicTrackNewMIDIChannelEvent(track, timeInBeats, &channelMessage)
-                    i += 3
-                } else if command == 0xC0 || command == 0xD0 {
-                    if i + 1 < length {
-                        var channelMessage = MIDIChannelMessage(status: status, data1: data[i + 1], data2: 0, reserved: 0)
-                        MusicTrackNewMIDIChannelEvent(track, timeInBeats, &channelMessage)
-                        i += 2
-                    } else {
-                        break
-                    }
-                } else {
-                    i += 1
-                }
-            } else {
-                i += 1
+        return withUnsafeBytes(of: packet.data) { raw in
+            var out: [MIDIChannelMessage] = []
+            var i = 0
+            while i < length {
+                let status = raw[i]
+                guard status >= 0x80, status < 0xF0 else { i += 1; continue }
+                let size = (status & 0xF0 == 0xC0 || status & 0xF0 == 0xD0) ? 2 : 3
+                guard i + size <= length else { break }
+                out.append(MIDIChannelMessage(status: status, data1: raw[i + 1], data2: size == 3 ? raw[i + 2] : 0, reserved: 0))
+                i += size
             }
+            return out
         }
     }
 
-    private func resetSilenceTimer() {
-        silenceTimer?.invalidate()
-        silenceTimer = Timer.scheduledTimer(withTimeInterval: silenceInterval, repeats: false) { _ in
-            self.queue.async {
-                self.saveCurrentSequenceAndReset()
-            }
+    /// Save the in-progress take now (used on quit). Blocks until written.
+    func flush() {
+        queue.sync {
+            silenceWork?.cancel()
+            saveCurrentSequenceAndReset()
         }
+    }
+
+    /// Must run on `queue`: GCD threads have no RunLoop, so a Timer would never fire.
+    private func resetSilenceTimer() {
+        silenceWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.saveCurrentSequenceAndReset()
+        }
+        silenceWork = work
+        queue.asyncAfter(deadline: .now() + silenceInterval, execute: work)
     }
 
     private func saveCurrentSequenceAndReset() {
         guard let sequence = currentSequence, let startTime = sequenceStartTime else { return }
 
+        // queue-owned count; liveNoteCount is main-thread UI state and may lag
+        let liveNoteCount = noteCount
         if liveNoteCount == 0 {
             createNewSequence()
             return
@@ -367,13 +371,19 @@ final class MIDIRecorderEngine: ObservableObject {
 
         let status = MusicSequenceFileCreate(sequence, localFileURL as CFURL, .midiType, [.eraseFile], 0)
 
-        if status == noErr {
+        guard status == noErr else {
+            // Keep the take in memory; the next silence retries.
+            print("Failed to save \(filename): \(status)")
             DispatchQueue.main.async {
-                self.lastSavedFilename = filename
+                self.lastSavedFilename = "Save failed (\(status))"
             }
-            executePostSaveCommand(forFileURL: localFileURL)
+            return
         }
 
+        DispatchQueue.main.async {
+            self.lastSavedFilename = filename
+        }
+        executePostSaveCommand(forFileURL: localFileURL)
         createNewSequence()
     }
 
@@ -386,7 +396,8 @@ final class MIDIRecorderEngine: ObservableObject {
             .replacingOccurrences(of: "%f", with: fileURL.path)
             .replacingOccurrences(of: "%n", with: fileURL.lastPathComponent)
 
-        queue.async {
+        // Not on `queue`: a slow command must not block recording or quit.
+        DispatchQueue.global(qos: .utility).async {
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/bin/sh")
             task.arguments = ["-c", formattedCommand]
