@@ -160,7 +160,10 @@ struct MenuBarView: View {
 final class MIDIRecorderEngine: ObservableObject {
     static let shared = MIDIRecorderEngine()
 
-    @Published var isPaused: Bool = false
+    @Published var isPaused: Bool = false {
+        didSet { queue.async { self.pausedOnQueue = self.isPaused } }
+    }
+
     @Published var liveNoteCount: Int = 0
     @Published var lastSavedFilename: String = "None"
 
@@ -178,6 +181,8 @@ final class MIDIRecorderEngine: ObservableObject {
                 }
             } catch {
                 print("Failed to update Launch at Login status: \(error.localizedDescription)")
+                launchAtLogin = oldValue // assigning inside didSet does not re-enter it
+                lastSavedFilename = "Launch at Login failed: \(error.localizedDescription)"
             }
         }
     }
@@ -187,11 +192,16 @@ final class MIDIRecorderEngine: ObservableObject {
 
     private var currentSequence: MusicSequence?
     private var currentTrack: MusicTrack?
-    private var sequenceStartTime: Date?
+    private var sequenceStartTime: Date? // wall clock, for the file name
+    private var sequenceStartHost: UInt64 = 0 // monotonic host time, for event times
+    private var lastEventBeats: MusicTimeStamp = 0
+    private var openNotes = Set<UInt16>() // (channel << 8 | note) with no note-off yet
+    private var pausedOnQueue = false
 
     private var silenceWork: DispatchWorkItem?
     private var noteCount = 0
     private let silenceInterval: TimeInterval = 5.0
+    private let maxTakeSeconds: TimeInterval = 30 * 60 // shortcut: fixed cap, make it a setting if someone needs longer takes
     private let outputDirectory: URL
 
     private let queue = DispatchQueue(label: "com.midi.recorder.queue")
@@ -200,7 +210,12 @@ final class MIDIRecorderEngine: ObservableObject {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         outputDirectory = docs.appendingPathComponent("MIDIRecorder")
 
-        try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        } catch {
+            print("Failed to create \(outputDirectory.path): \(error)")
+            lastSavedFilename = "Cannot create output folder"
+        }
         createNewSequence()
         setupMIDI()
     }
@@ -244,28 +259,25 @@ final class MIDIRecorderEngine: ObservableObject {
         if let seq = currentSequence {
             MusicSequenceNewTrack(seq, &currentTrack)
             if let track = currentTrack {
-                let watermark = "MIDIRecorder"
-                let dataBytes = Array(watermark.utf8)
-                let size = MemoryLayout<MIDIMetaEvent>.size + dataBytes.count
-                let mem = UnsafeMutablePointer<UInt8>.allocate(capacity: size)
-                defer { mem.deallocate() }
-                var status: OSStatus = -1
-                mem.withMemoryRebound(to: MIDIMetaEvent.self, capacity: 1) { ptr in
-                    ptr.pointee.metaEventType = 0x02
-                    ptr.pointee.dataLength = UInt32(dataBytes.count)
-                    memcpy(
-                        UnsafeMutableRawPointer(ptr).advanced(by: MemoryLayout<MIDIMetaEvent>.size),
-                        dataBytes,
-                        dataBytes.count,
-                    )
-                    status = MusicTrackNewMetaEvent(track, 0, ptr)
-                }
+                let dataBytes = Array("MIDIRecorder".utf8)
+                let dataOffset = MemoryLayout<MIDIMetaEvent>.offset(of: \.data)!
+                let size = dataOffset + dataBytes.count
+                let raw = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: MemoryLayout<MIDIMetaEvent>.alignment)
+                defer { raw.deallocate() }
+                memset(raw, 0, size)
+                let ptr = raw.bindMemory(to: MIDIMetaEvent.self, capacity: 1)
+                ptr.pointee.metaEventType = 0x02
+                ptr.pointee.dataLength = UInt32(dataBytes.count)
+                memcpy(raw.advanced(by: dataOffset), dataBytes, dataBytes.count)
+                let status = MusicTrackNewMetaEvent(track, 0, ptr)
                 if status != noErr {
                     print("Failed to add watermark meta-event: \(status)")
                 }
             }
         }
         sequenceStartTime = nil
+        lastEventBeats = 0
+        openNotes.removeAll()
         noteCount = 0
         DispatchQueue.main.async {
             self.liveNoteCount = 0
@@ -273,32 +285,54 @@ final class MIDIRecorderEngine: ObservableObject {
     }
 
     private func handleIncomingMIDIPackets(_ packetListPtr: UnsafePointer<MIDIPacketList>) {
-        // Copy every packet now: the list is only valid during this callback.
-        let packets = packetListPtr.unsafeSequence().map { $0.pointee }
+        // Parse now: the list is only valid during this callback.
+        let nowHost = AudioGetCurrentHostTime()
         let now = Date()
-        let paused = isPaused
+        var events: [(host: UInt64, msg: MIDIChannelMessage)] = []
+        for packet in packetListPtr.unsafeSequence() {
+            let p = packet.pointee
+            let host = p.timeStamp == 0 ? nowHost : p.timeStamp
+            let length = Int(p.length)
+            withUnsafeBytes(of: p.data) { raw in
+                for msg in ChannelParser.parse(UnsafeRawBufferPointer(rebasing: raw.prefix(length))) {
+                    events.append((host, msg))
+                }
+            }
+        }
 
         queue.async { [weak self] in
             guard let self else { return }
 
-            var messages = packets.flatMap(Self.channelMessages)
-            if paused {
+            var events = events
+            if pausedOnQueue {
                 // Still close notes opened before the pause, but never start a take.
-                messages = messages.filter(Self.isNoteOff)
-                if sequenceStartTime == nil { return }
+                events = events.filter { Self.isNoteOff($0.msg) }
+                if sequenceStartTime == nil {
+                    return
+                }
             }
             // Clock, active sensing and SysEx carry no channel messages: they must not start a take or reset the silence timer.
-            guard !messages.isEmpty else { return }
+            guard !events.isEmpty else { return }
 
+            // Endless input (looper, controller streaming CC) never goes silent: cut the take.
+            if let start = sequenceStartTime, now.timeIntervalSince(start) > maxTakeSeconds {
+                saveCurrentSequenceAndReset()
+            }
             if sequenceStartTime == nil {
                 sequenceStartTime = now
+                sequenceStartHost = events[0].host
             }
-            guard let startTime = sequenceStartTime, let track = currentTrack else { return }
+            guard let track = currentTrack else { return }
 
-            let timeInBeats = MusicTimeStamp(now.timeIntervalSince(startTime) * 2.0)
-            for var message in messages {
-                MusicTrackNewMIDIChannelEvent(track, timeInBeats, &message)
-                if message.status & 0xF0 == 0x90, message.data2 > 0 {
+            for var event in events {
+                let nanos = AudioConvertHostTimeToNanos(max(event.host, sequenceStartHost) - sequenceStartHost)
+                lastEventBeats = MusicTimeStamp(Double(nanos) / 1e9 * 2.0)
+                MusicTrackNewMIDIChannelEvent(track, lastEventBeats, &event.msg)
+                let key = UInt16(event.msg.status & 0x0F) << 8 | UInt16(event.msg.data1)
+                if Self.isNoteOff(event.msg) {
+                    openNotes.remove(key)
+                } else if event.msg.status & 0xF0 == 0x90 {
+                    openNotes.insert(key)
                     noteCount += 1
                 }
             }
@@ -313,24 +347,6 @@ final class MIDIRecorderEngine: ObservableObject {
 
     private static func isNoteOff(_ m: MIDIChannelMessage) -> Bool {
         m.status & 0xF0 == 0x80 || (m.status & 0xF0 == 0x90 && m.data2 == 0)
-    }
-
-    /// Splits a packet into channel messages; skips real-time bytes, SysEx and truncated messages.
-    private static func channelMessages(_ packet: MIDIPacket) -> [MIDIChannelMessage] {
-        let length = Int(packet.length)
-        return withUnsafeBytes(of: packet.data) { raw in
-            var out: [MIDIChannelMessage] = []
-            var i = 0
-            while i < length {
-                let status = raw[i]
-                guard status >= 0x80, status < 0xF0 else { i += 1; continue }
-                let size = (status & 0xF0 == 0xC0 || status & 0xF0 == 0xD0) ? 2 : 3
-                guard i + size <= length else { break }
-                out.append(MIDIChannelMessage(status: status, data1: raw[i + 1], data2: size == 3 ? raw[i + 2] : 0, reserved: 0))
-                i += size
-            }
-            return out
-        }
     }
 
     /// Save the in-progress take now (used on quit). Blocks until written.
@@ -361,8 +377,18 @@ final class MIDIRecorderEngine: ObservableObject {
             return
         }
 
+        // Close notes still held, so players do not sustain them forever.
+        if let track = currentTrack {
+            for key in openNotes {
+                var off = MIDIChannelMessage(status: 0x80 | UInt8(key >> 8), data1: UInt8(key & 0xFF), data2: 0, reserved: 0)
+                MusicTrackNewMIDIChannelEvent(track, lastEventBeats, &off)
+            }
+            openNotes.removeAll()
+        }
+
         let durationInSeconds = Int(Date().timeIntervalSince(startTime))
         let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX") // keep the name stable across regions
         dateFormatter.dateFormat = "yyyy-MM-dd HHmm (EEEE)"
         let dateString = dateFormatter.string(from: startTime)
 
@@ -374,6 +400,7 @@ final class MIDIRecorderEngine: ObservableObject {
         guard status == noErr else {
             // Keep the take in memory; the next silence retries.
             print("Failed to save \(filename): \(status)")
+            resetSilenceTimer() // retry even if no more MIDI arrives
             DispatchQueue.main.async {
                 self.lastSavedFilename = "Save failed (\(status))"
             }
@@ -385,6 +412,12 @@ final class MIDIRecorderEngine: ObservableObject {
         }
         executePostSaveCommand(forFileURL: localFileURL)
         createNewSequence()
+    }
+
+    private func reportPostSaveFailure(_ detail: String) {
+        DispatchQueue.main.async {
+            self.lastSavedFilename = "Post-save failed (\(detail))"
+        }
     }
 
     private func executePostSaveCommand(forFileURL fileURL: URL) {
@@ -407,9 +440,11 @@ final class MIDIRecorderEngine: ObservableObject {
                 task.waitUntilExit()
                 if task.terminationStatus != 0 {
                     print("Post-save command exited with status: \(task.terminationStatus)")
+                    self.reportPostSaveFailure("exit \(task.terminationStatus)")
                 }
             } catch {
                 print("Failed to run post-save command: \(error.localizedDescription)")
+                self.reportPostSaveFailure(error.localizedDescription)
             }
         }
     }
