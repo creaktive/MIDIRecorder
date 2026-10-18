@@ -27,7 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_: Notification) {
         // Prevent App Nap from throttling background recording timers
         activity = ProcessInfo.processInfo.beginActivity(
-            options: [.userInitiated, .idleSystemSleepDisabled],
+            options: .userInitiatedAllowingIdleSystemSleep,
             reason: "Continuous background MIDI capture",
         )
 
@@ -290,13 +290,11 @@ final class MIDIRecorderEngine: ObservableObject {
         let now = Date()
         var events: [(host: UInt64, msg: MIDIChannelMessage)] = []
         for packet in packetListPtr.unsafeSequence() {
-            let p = packet.pointee
-            let host = p.timeStamp == 0 ? nowHost : p.timeStamp
-            let length = Int(p.length)
-            withUnsafeBytes(of: p.data) { raw in
-                for msg in ChannelParser.parse(UnsafeRawBufferPointer(rebasing: raw.prefix(length))) {
-                    events.append((host, msg))
-                }
+            // Read in place: copying the struct keeps only 256 data bytes, but merged packets can be longer.
+            let host = packet.pointee.timeStamp == 0 ? nowHost : packet.pointee.timeStamp
+            let data = UnsafeRawPointer(packet) + MemoryLayout<MIDIPacket>.offset(of: \.data)!
+            for msg in ChannelParser.parse(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.length))) {
+                events.append((host, msg))
             }
         }
 
@@ -379,9 +377,11 @@ final class MIDIRecorderEngine: ObservableObject {
 
         // Close notes still held, so players do not sustain them forever.
         if let track = currentTrack {
+            // Close at save time, not at the last event: else a chord held through the silence gets zero length.
+            let endBeats = MusicTimeStamp(Double(AudioConvertHostTimeToNanos(AudioGetCurrentHostTime() - sequenceStartHost)) / 1e9 * 2.0)
             for key in openNotes {
                 var off = MIDIChannelMessage(status: 0x80 | UInt8(key >> 8), data1: UInt8(key & 0xFF), data2: 0, reserved: 0)
-                MusicTrackNewMIDIChannelEvent(track, lastEventBeats, &off)
+                MusicTrackNewMIDIChannelEvent(track, endBeats, &off)
             }
             openNotes.removeAll()
         }
@@ -395,6 +395,8 @@ final class MIDIRecorderEngine: ObservableObject {
         let filename = "\(dateString) \(liveNoteCount) notes, \(durationInSeconds) seconds.mid"
         let localFileURL = outputDirectory.appendingPathComponent(filename)
 
+        // The folder may have been deleted since launch; MusicSequenceFileCreate does not create it.
+        try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         let status = MusicSequenceFileCreate(sequence, localFileURL as CFURL, .midiType, [.eraseFile], 0)
 
         guard status == noErr else {
