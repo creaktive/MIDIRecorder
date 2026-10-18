@@ -11,12 +11,14 @@ Single-file macOS menu bar app. One source file: `MainApp.swift` (~420 lines). N
 open MIDIRecorder.app  # launch
 ```
 
-Build script (`build.sh`) compiles with `swiftc -O`, assembles the `.app` bundle structure, generates icons from `AppIcon.svg`, writes `Info.plist`, and codesigns. The app is a **LSUIElement** (menu bar only, no Dock icon).
+Build script (`build.sh`) compiles with `swiftc -O` for arm64 and x86_64 (merged with `lipo` into a universal binary), assembles the `.app` bundle structure, generates icons from `AppIcon.svg`, writes `Info.plist`, and codesigns. It can run from any directory and keeps its temp files in a `mktemp -d` dir. The app is a **LSUIElement** (menu bar only, no Dock icon).
+
+Signing: by default ad-hoc with the explicit requirement `designated => identifier "com.user.midirecorder"`, so the code hash does not decide identity. For a stable identity, run `SIGN_IDENTITY="<cert name>" ./build.sh` (see `security find-identity -v -p codesigning`).
 
 ## Constraints
 
 - **Swift 6.1.2** - see `.swift-version`
-- **macOS 13+** minimum deployment target (hardcoded in build.sh)
+- **macOS 13+** minimum deployment target (`MIN_MACOS` in build.sh; passed to `swiftc -target`, `actool`, and `LSMinimumSystemVersion`). Without `-target`, `swiftc` would default to the host OS version.
 - No package manager - all frameworks (`SwiftUI`, `CoreMIDI`, `AudioToolbox`, `ServiceManagement`) are system frameworks linked via `-framework` flags
 - Build artifacts (`.app/`, `AppIcon.appiconset/`, `Assets.xcassets/`) are gitignored
 
@@ -47,4 +49,6 @@ Output files go to `~/Documents/MIDIRecorder/`.
 - No tests and no way to send MIDI in CI. Verify by running the app with a real or virtual MIDI source.
 - Editing `MainApp.swift` requires re-running `./build.sh` then reopening the app (no hot reload outside Xcode)
 - Post-save shell commands use `%f` (full path) and `%n` (filename only) placeholders - executed via `/bin/sh -c`
+- `actool` only emits a plist here (no `Assets.car`); the app icon comes from the `.icns` built by `iconutil`. The menu bar icon is `menuBar.png`, rendered at 36px for the 18pt size set in `AppDelegate`.
+- If macOS re-asks for Documents access or Launch at Login approval after a rebuild, sign with `SIGN_IDENTITY` (a real certificate); the ad-hoc identifier requirement is not verified to satisfy TCC.
 - Launch at Login uses `SMAppService`; changing it requires no rebuild, just toggle in-app
